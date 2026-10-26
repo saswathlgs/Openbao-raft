@@ -1,0 +1,67 @@
+---
+- name: Install openssl
+  ansible.builtin.apt:
+    name: openssl
+    state: present
+    update_cache: true
+
+- name: Create TLS directory
+  ansible.builtin.file:
+    path: "{{ openbao_tls_dir }}"
+    state: directory
+    owner: root
+    group: "{{ openbao_group }}"
+    mode: "0750"
+
+# Self-signed CA for the PoC — note: swap for cert-manager in prod
+- name: Generate CA key
+  community.crypto.openssl_privatekey:
+    path: "{{ openbao_tls_dir }}/ca.key"
+    size: 4096
+    mode: "0640"
+    group: "{{ openbao_group }}"
+  run_once: true
+  delegate_to: bao-1
+
+- name: Generate CA cert
+  community.crypto.x509_certificate:
+    path: "{{ openbao_tls_dir }}/ca.crt"
+    privatekey_path: "{{ openbao_tls_dir }}/ca.key"
+    provider: selfsigned
+    selfsigned_not_after: "+3650d"
+  run_once: true
+  delegate_to: bao-1
+
+- name: Distribute CA cert to all nodes
+  ansible.builtin.copy:
+    src: "{{ openbao_tls_dir }}/ca.crt"
+    dest: "{{ openbao_tls_dir }}/ca.crt"
+    owner: root
+    group: "{{ openbao_group }}"
+    mode: "0644"
+
+- name: Generate per-node key
+  community.crypto.openssl_privatekey:
+    path: "{{ openbao_tls_key }}"
+    size: 4096
+    mode: "0640"
+    group: "{{ openbao_group }}"
+
+- name: Generate CSR
+  community.crypto.openssl_csr:
+    path: "{{ openbao_tls_dir }}/server.csr"
+    privatekey_path: "{{ openbao_tls_key }}"
+    common_name: "{{ inventory_hostname }}"
+    subject_alt_name:
+      - "IP:{{ ansible_host }}"
+      - "DNS:{{ inventory_hostname }}"
+
+- name: Sign server cert with CA
+  community.crypto.x509_certificate:
+    path: "{{ openbao_tls_cert }}"
+    csr_path: "{{ openbao_tls_dir }}/server.csr"
+    ownca_path: "{{ openbao_tls_dir }}/ca.crt"
+    ownca_privatekey_path: "{{ openbao_tls_dir }}/ca.key"
+    provider: ownca
+    ownca_not_after: "+365d"
+  delegate_to: bao-1

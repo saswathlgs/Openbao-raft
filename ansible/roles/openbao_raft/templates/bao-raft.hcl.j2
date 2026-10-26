@@ -1,0 +1,37 @@
+ui = false
+
+storage "raft" {
+  path    = "{{ openbao_data_dir }}"
+  node_id = "{{ inventory_hostname }}"
+
+{% for peer in openbao_raft_peers %}
+  retry_join {
+    leader_api_addr         = "{{ peer }}"
+    leader_ca_cert_file     = "{{ openbao_tls_ca }}"
+    leader_client_cert_file = "{{ openbao_tls_cert }}"
+    leader_client_key_file  = "{{ openbao_tls_key }}"
+  }
+{% endfor %}
+}
+
+# Transit auto-unseal — no human required after reboot
+seal "transit" {
+  address         = "{{ bao_transit_addr }}"
+  token           = "{{ _unseal_token }}"
+  disable_renewal = "false"
+  key_name        = "{{ bao_transit_key }}"
+  mount_path      = "{{ bao_transit_mount }}/"
+  tls_ca_cert     = "{{ openbao_tls_ca }}"
+}
+
+listener "tcp" {
+  address       = "0.0.0.0:8200"
+  cluster_addr  = "{{ ansible_host }}:8201"
+  tls_cert_file = "{{ openbao_tls_cert }}"
+  tls_key_file  = "{{ openbao_tls_key }}"
+  tls_client_ca_file = "{{ openbao_tls_ca }}"
+}
+
+api_addr     = "https://{{ ansible_host }}:8200"
+cluster_addr = "https://{{ ansible_host }}:8201"
+log_level    = "info"

@@ -1,0 +1,23 @@
+# Pin the OpenBao version — never use "latest"
+openbao_version: "2.0.3"
+openbao_user: openbao
+openbao_group: openbao
+openbao_data_dir: /opt/openbao/data
+openbao_config_dir: /etc/openbao
+openbao_bin: /usr/local/bin/bao
+
+# TLS — self-signed for PoC; swap for cert-manager in prod
+openbao_tls_dir: /etc/openbao/tls
+openbao_tls_ca: "{{ openbao_tls_dir }}/ca.crt"
+openbao_tls_cert: "{{ openbao_tls_dir }}/server.crt"
+openbao_tls_key: "{{ openbao_tls_dir }}/server.key"
+
+# Raft peer retry_join list — all three nodes
+openbao_raft_peers:
+  - "https://172.16.10.11:8201"
+  - "https://172.16.10.12:8201"
+  - "https://172.16.10.13:8201"
+
+# Transit mount path on bao-transit
+bao_transit_mount: transit
+bao_transit_key: golden-image   # reuse the key already created by the golden-image signing pipeline

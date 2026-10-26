@@ -1,0 +1,189 @@
+---
+- name: Create openbao group
+  ansible.builtin.group:
+    name: "{{ openbao_group }}"
+    system: true
+
+- name: Create openbao user
+  ansible.builtin.user:
+    name: "{{ openbao_user }}"
+    group: "{{ openbao_group }}"
+    system: true
+    shell: /sbin/nologin
+    home: /etc/openbao
+    create_home: false
+
+- name: Download OpenBao binary
+  ansible.builtin.get_url:
+    url: "https://github.com/openbao/openbao/releases/download/v{{ openbao_version }}/bao_{{ openbao_version }}_linux_amd64.zip"
+    dest: "/tmp/bao_{{ openbao_version }}.zip"
+    checksum: "sha256:https://github.com/openbao/openbao/releases/download/v{{ openbao_version }}/bao_{{ openbao_version }}_SHA256SUMS"
+    mode: "0644"
+
+- name: Extract binary
+  ansible.builtin.unarchive:
+    src: "/tmp/bao_{{ openbao_version }}.zip"
+    dest: /usr/local/bin/
+    remote_src: true
+    include: ["bao"]
+  notify: restart openbao
+
+- name: Set binary permissions
+  ansible.builtin.file:
+    path: "{{ openbao_bin }}"
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Create config directory
+  ansible.builtin.file:
+    path: "{{ openbao_config_dir }}"
+    state: directory
+    owner: "{{ openbao_user }}"
+    group: "{{ openbao_group }}"
+    mode: "0750"
+
+- name: Create data directory
+  ansible.builtin.file:
+    path: "{{ openbao_data_dir }}"
+    state: directory
+    owner: "{{ openbao_user }}"
+    group: "{{ openbao_group }}"
+    mode: "0700"
+
+- name: Template transit config
+  ansible.builtin.template:
+    src: bao-transit.hcl.j2
+    dest: "{{ openbao_config_dir }}/openbao.hcl"
+    owner: "{{ openbao_user }}"
+    group: "{{ openbao_group }}"
+    mode: "0640"
+  notify: restart openbao
+
+- name: Install systemd unit
+  ansible.builtin.template:
+    src: openbao.service.j2
+    dest: /etc/systemd/system/openbao.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - reload systemd
+    - restart openbao
+
+- name: Enable and start openbao
+  ansible.builtin.systemd:
+    name: openbao
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Wait for transit API to be ready
+  ansible.builtin.uri:
+    url: "https://{{ ansible_host }}:8200/v1/sys/health"
+    validate_certs: false
+    status_code: [200, 429, 472, 473, 501, 503]
+  register: health
+  until: health.status in [200, 429, 472, 473, 501, 503]
+  retries: 20
+  delay: 5
+
+# Init transit node if not already initialised
+- name: Check init status
+  ansible.builtin.command: "{{ openbao_bin }} operator init -status"
+  environment:
+    BAO_ADDR: "https://{{ ansible_host }}:8200"
+    BAO_CACERT: "{{ openbao_tls_ca }}"
+  register: init_status
+  changed_when: false
+  failed_when: init_status.rc not in [0, 2]
+
+- name: Initialise transit node
+  ansible.builtin.command: >
+    {{ openbao_bin }} operator init
+    -key-shares=1 -key-threshold=1
+    -format=json
+  environment:
+    BAO_ADDR: "https://{{ ansible_host }}:8200"
+    BAO_CACERT: "{{ openbao_tls_ca }}"
+  register: transit_init
+  when: init_status.rc == 2
+  no_log: true
+
+- name: Store transit init output with SOPS
+  ansible.builtin.shell: >
+    echo '{{ transit_init.stdout }}' |
+    sops --encrypt --age $(cat ~/.config/sops/age/keys.txt | grep 'public key:' | awk '{print $NF}')
+    --input-type json --output-type json
+    /dev/stdin > {{ playbook_dir }}/../secrets/transit-init.sops.json
+  when: transit_init is changed
+  delegate_to: localhost
+  no_log: true
+
+- name: Unseal transit (single key, PoC)
+  ansible.builtin.command: >
+    {{ openbao_bin }} operator unseal
+    {{ (transit_init.stdout | from_json).unseal_keys_b64[0] }}
+  environment:
+    BAO_ADDR: "https://{{ ansible_host }}:8200"
+    BAO_CACERT: "{{ openbao_tls_ca }}"
+  when: transit_init is changed
+  no_log: true
+
+- name: Enable transit secrets engine
+  ansible.builtin.command: >
+    {{ openbao_bin }} secrets enable -path={{ bao_transit_mount }} transit
+  environment:
+    BAO_ADDR: "https://{{ ansible_host }}:8200"
+    BAO_CACERT: "{{ openbao_tls_ca }}"
+    BAO_TOKEN: "{{ (transit_init.stdout | from_json).root_token }}"
+  when: transit_init is changed
+  no_log: true
+
+- name: Create transit key for Raft auto-unseal
+  ansible.builtin.command: >
+    {{ openbao_bin }} write -force {{ bao_transit_mount }}/keys/{{ bao_transit_key }}
+  environment:
+    BAO_ADDR: "https://{{ ansible_host }}:8200"
+    BAO_CACERT: "{{ openbao_tls_ca }}"
+    BAO_TOKEN: "{{ (transit_init.stdout | from_json).root_token }}"
+  when: transit_init is changed
+  no_log: true
+
+- name: Create policy for Raft unseal
+  ansible.builtin.command: >
+    {{ openbao_bin }} policy write raft-unseal -
+  args:
+    stdin: |
+      path "{{ bao_transit_mount }}/encrypt/{{ bao_transit_key }}" { capabilities = ["update"] }
+      path "{{ bao_transit_mount }}/decrypt/{{ bao_transit_key }}" { capabilities = ["update"] }
+  environment:
+    BAO_ADDR: "https://{{ ansible_host }}:8200"
+    BAO_CACERT: "{{ openbao_tls_ca }}"
+    BAO_TOKEN: "{{ (transit_init.stdout | from_json).root_token }}"
+  when: transit_init is changed
+  no_log: true
+
+- name: Create periodic token for Raft unseal
+  ansible.builtin.command: >
+    {{ openbao_bin }} token create
+    -policy=raft-unseal
+    -period=24h
+    -format=json
+  environment:
+    BAO_ADDR: "https://{{ ansible_host }}:8200"
+    BAO_CACERT: "{{ openbao_tls_ca }}"
+    BAO_TOKEN: "{{ (transit_init.stdout | from_json).root_token }}"
+  register: unseal_token
+  when: transit_init is changed
+  no_log: true
+
+- name: Store unseal token with SOPS
+  ansible.builtin.shell: >
+    echo '{{ unseal_token.stdout }}' |
+    sops --encrypt --age $(cat ~/.config/sops/age/keys.txt | grep 'public key:' | awk '{print $NF}')
+    --input-type json --output-type json
+    /dev/stdin > {{ playbook_dir }}/../secrets/raft-unseal-token.sops.json
+  when: transit_init is changed
+  delegate_to: localhost
+  no_log: true

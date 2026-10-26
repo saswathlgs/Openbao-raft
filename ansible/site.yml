@@ -1,0 +1,28 @@
+---
+# Play 1 — TLS (all nodes need certs before services start)
+- name: Generate TLS certificates
+  hosts: openbao
+  become: true
+  roles:
+    - role: openbao_tls
+
+# Play 2 — Transit unsealer FIRST
+- name: Configure bao-transit (auto-unseal provider)
+  hosts: bao_transit
+  become: true
+  roles:
+    - role: openbao_transit
+
+# Play 3 — Raft cluster
+- name: Configure Raft cluster nodes
+  hosts: bao_raft
+  become: true
+  roles:
+    - role: openbao_raft
+
+# Play 4 — Init once, store with SOPS
+- name: Initialise cluster and store recovery material
+  hosts: bao-1   # run init from the first node only
+  become: true
+  roles:
+    - role: openbao_init

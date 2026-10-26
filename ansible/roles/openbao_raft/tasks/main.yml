@@ -1,0 +1,80 @@
+---
+- name: Create openbao group and user
+  ansible.builtin.group:
+    name: "{{ openbao_group }}"
+    system: true
+
+- name: Create openbao user
+  ansible.builtin.user:
+    name: "{{ openbao_user }}"
+    group: "{{ openbao_group }}"
+    system: true
+    shell: /sbin/nologin
+
+- name: Download and extract OpenBao binary
+  ansible.builtin.get_url:
+    url: "https://github.com/openbao/openbao/releases/download/v{{ openbao_version }}/bao_{{ openbao_version }}_linux_amd64.zip"
+    dest: "/tmp/bao_{{ openbao_version }}.zip"
+    checksum: "sha256:https://github.com/openbao/openbao/releases/download/v{{ openbao_version }}/bao_{{ openbao_version }}_SHA256SUMS"
+    mode: "0644"
+
+- name: Extract binary
+  ansible.builtin.unarchive:
+    src: "/tmp/bao_{{ openbao_version }}.zip"
+    dest: /usr/local/bin/
+    remote_src: true
+    include: ["bao"]
+  notify: restart openbao
+
+- name: Set binary permissions
+  ansible.builtin.file:
+    path: "{{ openbao_bin }}"
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Read unseal token from SOPS
+  ansible.builtin.command: >
+    sops --decrypt --extract '["auth"]["client_token"]'
+    {{ playbook_dir }}/../secrets/raft-unseal-token.sops.json
+  register: raft_unseal_token
+  delegate_to: localhost
+  no_log: true
+  changed_when: false
+
+- name: Create config and data dirs
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ openbao_user }}"
+    group: "{{ openbao_group }}"
+    mode: "0700"
+  loop:
+    - "{{ openbao_config_dir }}"
+    - "{{ openbao_data_dir }}"
+
+- name: Template Raft config
+  ansible.builtin.template:
+    src: bao-raft.hcl.j2
+    dest: "{{ openbao_config_dir }}/openbao.hcl"
+    owner: "{{ openbao_user }}"
+    group: "{{ openbao_group }}"
+    mode: "0640"
+  vars:
+    _unseal_token: "{{ raft_unseal_token.stdout }}"
+  notify: restart openbao
+
+- name: Install systemd unit
+  ansible.builtin.template:
+    src: openbao.service.j2
+    dest: /etc/systemd/system/openbao.service
+  notify:
+    - reload systemd
+    - restart openbao
+
+- name: Enable and start openbao
+  ansible.builtin.systemd:
+    name: openbao
+    enabled: true
+    state: started
+    daemon_reload: true

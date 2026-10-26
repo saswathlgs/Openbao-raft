@@ -1,0 +1,75 @@
+---
+- name: Wait for Raft API to be ready
+  ansible.builtin.uri:
+    url: "https://{{ ansible_host }}:8200/v1/sys/health"
+    validate_certs: false
+    status_code: [200, 429, 472, 473, 501, 503]
+  register: health
+  until: health.status in [200, 429, 472, 473, 501, 503]
+  retries: 30
+  delay: 5
+
+- name: Check init status
+  ansible.builtin.command: "{{ openbao_bin }} operator init -status"
+  environment:
+    BAO_ADDR: "https://{{ ansible_host }}:8200"
+    BAO_CACERT: "{{ openbao_tls_ca }}"
+  register: init_status
+  changed_when: false
+  failed_when: init_status.rc not in [0, 2]
+
+- name: Initialise Raft cluster (recovery key mode for transit unseal)
+  ansible.builtin.command: >
+    {{ openbao_bin }} operator init
+    -recovery-shares=5 -recovery-threshold=3
+    -format=json
+  environment:
+    BAO_ADDR: "https://{{ ansible_host }}:8200"
+    BAO_CACERT: "{{ openbao_tls_ca }}"
+  register: cluster_init
+  when: init_status.rc == 2
+  no_log: true
+
+- name: Encrypt and store init output with SOPS (ADR-025)
+  ansible.builtin.shell: >
+    echo '{{ cluster_init.stdout }}' |
+    sops --encrypt --age $(cat ~/.config/sops/age/keys.txt | grep 'public key:' | awk '{print $NF}')
+    --input-type json --output-type json
+    /dev/stdin > {{ playbook_dir }}/../secrets/init-output.sops.json
+  when: cluster_init is changed
+  delegate_to: localhost
+  no_log: true
+
+- name: Wait for cluster to elect a leader (auto-unsealed via transit)
+  ansible.builtin.command: "{{ openbao_bin }} status -format=json"
+  environment:
+    BAO_ADDR: "https://{{ ansible_host }}:8200"
+    BAO_CACERT: "{{ openbao_tls_ca }}"
+    BAO_TOKEN: "{{ (cluster_init.stdout | from_json).root_token }}"
+  register: bao_status
+  until: (bao_status.stdout | from_json).initialized and not (bao_status.stdout | from_json).sealed
+  retries: 20
+  delay: 5
+  when: cluster_init is changed
+  no_log: true
+
+- name: Enable KV v2 test mount
+  ansible.builtin.command: >
+    {{ openbao_bin }} secrets enable -path=secret kv-v2
+  environment:
+    BAO_ADDR: "https://{{ ansible_host }}:8200"
+    BAO_CACERT: "{{ openbao_tls_ca }}"
+    BAO_TOKEN: "{{ (cluster_init.stdout | from_json).root_token }}"
+  when: cluster_init is changed
+  no_log: true
+
+- name: Write test secret
+  ansible.builtin.command: >
+    {{ openbao_bin }} kv put secret/poc/test
+    hello=world from=openbao-poc
+  environment:
+    BAO_ADDR: "https://{{ ansible_host }}:8200"
+    BAO_CACERT: "{{ openbao_tls_ca }}"
+    BAO_TOKEN: "{{ (cluster_init.stdout | from_json).root_token }}"
+  when: cluster_init is changed
+  no_log: true

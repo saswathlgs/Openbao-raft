@@ -1,0 +1,17 @@
+ui = false
+
+storage "file" {
+  path = "{{ openbao_data_dir }}"
+}
+
+listener "tcp" {
+  address       = "0.0.0.0:8200"
+  cluster_addr  = "{{ ansible_host }}:8201"
+  tls_cert_file = "{{ openbao_tls_cert }}"
+  tls_key_file  = "{{ openbao_tls_key }}"
+  tls_client_ca_file = "{{ openbao_tls_ca }}"
+}
+
+api_addr     = "https://{{ ansible_host }}:8200"
+cluster_addr = "https://{{ ansible_host }}:8201"
+log_level    = "info"
